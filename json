@@ -92,6 +92,9 @@ if($main::args{'method'} eq "get_account") {
 } elsif($main::args{'method'} eq "delete_contact") {
     delete_contact();
     exit;
+} elsif($main::args{'method'} eq "delete_contactperson") {
+    delete_contactperson();
+    exit;
 } elsif($main::args{'method'} eq "update_contact") {
     update_contact();
     exit;
@@ -208,6 +211,49 @@ sub delete_contact {
     print JSON->new->encode(\%rawdata);
     exit;
 }
+
+# Delete contactperson function for elasticio-wice component shterion 15/01/2018
+
+sub delete_contactperson {
+
+    WicePermissions::perm_init();
+
+# The following should not be necessary since we will call AddressLib::perm_editdel_contactperson() some lines below:
+#    if(!WicePermissions::perm_editdel("address_contactperson")) {
+#	my %rawdata = (error=>"permission denied");
+#	print JSON->new->encode(\%rawdata);
+#	exit;
+#    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    # check if $main::username may modify appointment with rowid=$$data{'rowid'}
+#    if(!AddressLib::perm_editdel_contactperson($$data{'rowid'})) {
+#	my %rawdata = (error=>"permission denied");
+#	print JSON->new->encode(\%rawdata);
+#	exit;
+#   }
+
+    # we don't really delete the contactperson, instead we remove the favourite tag:
+    #WiceSQL::Do("DELETE FROM favourite WHERE username=\"$main::username\" AND mandant=$main::mandant AND for_table=\"address_contactperson\" AND for_rowid=".WiceSQL::quote($$data{'rowid'}));
+
+    # we just set the mandant of negative instead of real delete from db
+    WiceSQL::Do("UPDATE address_contactperson SET mandant=-\"$main::mandant\" WHERE rowid=\"$$data{'rowid'}\"");
+
+
+    # also, remove the fav tag for any corresponding company:
+#    my $company_rowid = WiceSQL::select_single_row("SELECT for_rowid FROM address_contactperson WHERE mandant=$main::mandant AND rowid=".WiceSQL::quote($$data{'rowid'}));
+#    if($company_rowid) {
+#	WiceSQL::Do("DELETE FROM favourite WHERE username=\"$main::username\" AND mandant=$main::mandant AND for_table=\"address_company\" AND for_rowid=".WiceSQL::quote($company_rowid));
+#    }
+
+    my %rawdata = (rowid=>$$data{'rowid'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+# END
 
 sub insert_event {
 
