@@ -1,0 +1,704 @@
+#!/usr/bin/env perl
+###############################################################################
+#
+# WICE Outlook synchronizer connector script
+# Do not confound this with json_backend (generic JSON API backend)
+#
+# main script
+#
+# Copyright (C) WICE GmbH Germany, 2011.  All rights reserved
+#
+###############################################################################
+
+use strict;
+use Encode;
+use JSON;
+use CGI;
+use Crypt::UnixCrypt;
+use Data::Dumper;
+
+use WiceAuth;
+use WiceSQL;
+use WiceMisc;
+use Calendar;
+use AddressLib;
+
+
+# Dev links
+
+# https://localhost:1443/pserv/base/json?method=login&username=shterion&mandant_name=sandbox&password=d36adb53
+# https://localhost:1443/pserv/base/json?method=get_contacts&cookie=
+
+# https://localhost:1443/pserv/base/json?method=insert_event&cookie=h9siogjehkpguprwdgqwtpmwjln6i7n9&data={"title":"TEST", "dt_start":"2014-10-10 13:15:00", "dt_end":"2014-10-10 15:30:00", "location":"Büro Hamburg2", "description":"Längere Beschreibung...", "employees":"chahn@wice.de,sgatzke@wice.de"}
+# https://localhost:1443/pserv/base/json?method=insert_contact&cookie=h9siogjehkpguprwdgqwtpmwjln6i7n9&data={"name":"Hoobs", "firstname": "Thomas" }
+
+
+# Vorgehensweise:
+
+# 1. Zuerst werden die Login-Daten (Mandantenname, Username und Passwort) an den Server gesendet, z.B:
+# wget 'https://node75.wice-net.de/pserv/base/json?method=login&username=ihr_username&mandant_name=ihr_mandantenname&password=ihr_passwort'
+# Später werden die Daten natürlich per HTTP-POST gesendet. Es wird auch noch einen zusätzlichen API-Key-Parameter geben.
+
+# 2. Nach erfolglosem Login meldet der Server einen Fehler zurück. Nach erfolgreichem Login erhalten Sie einen cookie-Parameter zurück. Falls Sie gleichzeitig ganz normal über den Browser in Wice angemeldet sind, werden Sie leider derzeit noch ausgeloggt, das wird noch behoben. Rückmeldung also z.B.
+# {"cookie":"9a9tuel9byr8u553ful45ndhd7quggan"}
+
+# 3. Nun können Sie die Kontakte anfordern:
+# wget 'https://node75.wice-net.de/pserv/base/json?method=get_contacts&cookie=...'
+# Hier setzen Sie den richtigen Cookie-Wert ein, den der Server zuvor zurückgegeben hat.
+
+# 4. Die Termine können mit "method=get_events" ebenso angefordert werden.
+
+# 5. Neue Termine können mit "insert_event" erzeugt werden. Mitarbeiter werden dabei über die Emailadresse identifiziert und dann in Wice korrekt verlinkt. Wice meldet dann den rowid-Parameter im JSON-Format zurück (ähnlich der Cookie-Rückmeldung nach dem Login). Es müssen nicht alle Felder mitgeliefert werden. Auf jeden Fall sollten aber "title", "dt_start", "dt_end" und "employees" gefüllt sein, sonst kann der Termin in Wice nicht angezeigt werden. Sollte der User keine Berechtigung haben, Termine in Wice einzutragen, wird {"error":"permission denied"} zurückgemeldet.
+# wget -O - 'http://localhost:1080/pserv/base/json?method=insert_event&cookie=g8r6ltmlo1hxbuf0al0muhmru503np1o&data={"title":"TEST", "dt_start":"2014-10-10 13:15:00", "dt_end":"2014-10-10 15:30:00", "location":"Büro Hamburg2", "description":"Längere Beschreibung...", "employees":"chahn@wice.de,sgatzke@wice.de"}'
+
+# 6. Analog zu "insert_event" kann mit "update_event" ein Eintrag aktualisiert werden. Es muss mindestens der "rowid"-Parameter gefüllt sein, darüber hinaus können die Parameter der insert_event-Methode eingesetzt werden. Sollte der User keine Berechtigung haben, den gewünschten Termin in Wice zu aktualisieren, wird {"error":"permission denied"} zurückgemeldet.
+
+# 7. Mit "delete_event" kann ein Termin gelöscht werden. Dies hat nicht unbedingt zur Folge, dass der Termin komplett aus Wice verschwindet. Es wird zunächst nur der aktuelle Mitarbeiter aus dem Termin entfernt. Sind keine Mitarbeiter mehr übrig, wird der Termin tatsächlich aus Wice entfernt. Der aktuelle Mitarbeiter wird automatisch aus der Session bestimmt. Sollte der User keine Berechtigung haben, den gewünschten Termin in Wice zu löschen, wird {"error":"permission denied"} zurückgemeldet.
+# wget -O - 'http://localhost:1080/pserv/base/json?method=delete_event&cookie=g8r6ltmlo1hxbuf0al0muhmru503np1o&data={"rowid":"77161"}'
+# https://localhost:1443/pserv/base/json?method=delete_contact&cookie=1ihpo1xu7apsgmmglen0ff2ozj4jpaeu&data={"rowid":"410852"}
+
+# 8. Analog zu Event stehen auch für die Kontakte die Methoden "insert_contact", "update_contact", und "delete_contact" zur Verfügung. insert_contact() liefert als Rückgabewert einerseits die RowID des neuen Ansprechpartners zurück (Parameter "rowid"), andererseits die RowID der Firma, die angelegt wurde, falls der Wert "address_company_name" gefüllt war (Parameter "for_rowid"). Mit der Firmen-RowID kann bei Bedarf ein weiterer Request gemacht werden, bei dem weitere Felder an der Firma ausgefüllt werden; dies geschieht mit der Methode "update_contact".
+
+# 9. Zur Verwendung des Outlook Synchronizers auf einem Windows-Server zur Bedienung von Exchange-Installationen können Exchange-Account-Daten mit "get_account=1" abgefragt werden. Beispiel:
+# wget -O - 'http://localhost:1080/pserv/base/json?get_account=1&cookie=g8r6ltmlo1hxbuf0al0muhmru503np1o"
+
+
+my $cgi = new CGI;
+my %args = $cgi->Vars;
+if($args{'method'} eq "login") {
+    login(\%args);
+    exit;
+}
+
+WiceAuth::EnterCGI($ENV{'SCRIPT_NAME'});
+
+WiceMisc::print_header("application/json");
+$main::print_json_only = 1;
+
+# check usercats.outlook_sync_enabled:
+if(!WiceSQL::select_single_row("SELECT outlook_sync_enabled FROM usercats WHERE username=\"$main::username\" AND mandant=$main::mandant")) {
+    exit;
+}
+
+if($main::args{'method'} eq "get_account") {
+    get_account();
+    exit;
+} elsif($main::args{'method'} eq "get_contacts") {
+    get_contacts();
+    exit;
+} elsif($main::args{'method'} eq "insert_contact") {
+    insert_contact();
+    exit;
+} elsif($main::args{'method'} eq "delete_contact") {
+    delete_contact();
+    exit;
+} elsif($main::args{'method'} eq "update_contact") {
+    update_contact();
+    exit;
+} elsif($main::args{'method'} eq "insert_company") {
+    insert_company();
+    exit;
+} elsif($main::args{'method'} eq "update_company") {
+    update_company();
+    exit;
+} elsif($main::args{'method'} eq "get_events") {
+    get_events();
+    exit;
+} elsif($main::args{'method'} eq "insert_event") {
+    insert_event();
+    exit;
+} elsif($main::args{'method'} eq "delete_event") {
+    delete_event();
+    exit;
+} elsif($main::args{'method'} eq "update_event") {
+    update_event();
+    exit;
+}
+
+
+exit;
+
+
+
+
+sub get_account {
+
+    my $cgi = new CGI;
+    my %args = $cgi->Vars;
+
+    my %rawdata = ();
+    WiceSQL::select_single_row_hash("SELECT outlook_account.* FROM outlook_account WHERE username=\"$main::username\" AND mandant=$main::mandant", \%rawdata);
+    print JSON->new->encode(\%rawdata);
+    exit;
+
+}
+
+
+
+sub delete_event {
+
+    WicePermissions::perm_init();
+    if(!WicePermissions::perm_editdel("calendar")) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    # check if $main::username may modify appointment with rowid=$$data{'rowid'}
+    if(!Calendar::perm_editdel_appointment($$data{'rowid'})) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    # we don't really delete appointment with rowid=$$data{'rowid'} - we just remove the current employee from the appointment
+    my $current_emp_id = WiceMisc::get_employee_id_from_username($main::username);
+    my %employees = ();
+    foreach my $emp_id(split(/[,]/, WiceSQL::select_single_row("SELECT employees FROM appointment WHERE mandant=$main::mandant AND rowid=".WiceSQL::quote($$data{'rowid'})))) {
+	if($emp_id && $emp_id!=$current_emp_id) {
+	    $employees{$emp_id} = 1;
+	}
+    }
+
+    my %update = (employees => join("\t", (keys %employees)));
+
+    WiceSQL::Update("appointment", $$data{'rowid'}, \%update);
+
+    my %rawdata = (rowid=>$$data{'rowid'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+
+sub delete_contact {
+
+    WicePermissions::perm_init();
+
+# The following should not be necessary since we will call AddressLib::perm_editdel_contactperson() some lines below:
+#    if(!WicePermissions::perm_editdel("address_contactperson")) {
+#	my %rawdata = (error=>"permission denied");
+#	print JSON->new->encode(\%rawdata);
+#	exit;
+#    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    # check if $main::username may modify appointment with rowid=$$data{'rowid'}
+    if(!AddressLib::perm_editdel_contactperson($$data{'rowid'})) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    # we don't really delete the contactperson, instead we remove the favourite tag:
+    WiceSQL::Do("DELETE FROM favourite WHERE username=\"$main::username\" AND mandant=$main::mandant AND for_table=\"address_contactperson\" AND for_rowid=".WiceSQL::quote($$data{'rowid'}));
+
+    # also, remove the fav tag for any corresponding company:
+    my $company_rowid = WiceSQL::select_single_row("SELECT for_rowid FROM address_contactperson WHERE mandant=$main::mandant AND rowid=".WiceSQL::quote($$data{'rowid'}));
+    if($company_rowid) {
+	WiceSQL::Do("DELETE FROM favourite WHERE username=\"$main::username\" AND mandant=$main::mandant AND for_table=\"address_company\" AND for_rowid=".WiceSQL::quote($company_rowid));
+    }
+
+    my %rawdata = (rowid=>$$data{'rowid'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+sub insert_event {
+
+    WicePermissions::perm_init();
+    if(!WicePermissions::perm_insert("calendar")) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+    ($$data{'user_group'}, $$data{'category1'}, $$data{'private_overwrite'}) = WiceSQL::select_single_row("SELECT appointment_default_groups, imported_appointments_category1, imported_appointments_private FROM usercats WHERE username=\"$main::username\" AND mandant=$main::mandant");
+
+    if($$data{'private_overwrite'}) {
+	$$data{'private'} = 1;
+    }
+
+    # decode employees: (e.g. "chahn@wice.de, hschmidt@wice.de" => "1\t5"):
+    my $employees_emails = $$data{'employees'};
+    $$data{'employees'} = "";
+    foreach my $emp_email(split(/[,]/,$employees_emails)) {
+	$emp_email =~ s/^\s//g;
+	$emp_email =~ s/\s$//g;
+	my $emp_rowid = WiceSQL::select_single_row("SELECT rowid FROM address_employee WHERE email LIKE ".WiceSQL::quote($emp_email)." AND mandant=$main::mandant AND (deactivated IS NULL OR deactivated=0)");
+	if($emp_rowid) {
+	    $$data{'employees'} .= "$emp_rowid\t";
+	}
+    }
+    $$data{'employees'} =~ s/\t$//g;
+
+    # Check if there is already an identical appointment, i.e. all fields identical except last_update, rowid and history_log. If yes, don't insert a new one, just return the existing rowid:
+    # TODO
+
+    my $rowid = WiceSQL::Insert("appointment", "returnID", undef, $data);
+
+    my %rawdata = (rowid=>$rowid);
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+
+sub insert_contact {
+
+    WicePermissions::perm_init();
+    if(!WicePermissions::perm_insert("address_company") || !WicePermissions::perm_insert("address_contactperson")) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+    $$data{'user_group'} = WiceSQL::select_single_row("SELECT address_default_groups FROM usercats WHERE username=\"$main::username\" AND mandant=$main::mandant");
+
+    # determine company rowid:
+    if(!$$data{'for_rowid'}) {
+	$$data{'for_rowid'} = _get_company_rowid($$data{'company_name'}, $$data{'company_zip_code'});
+    }
+
+    if($$data{'for_rowid'}) {
+	$$data{'for_table'} = "address_company";
+    }
+
+    if(!$$data{'address_category1'}) {
+	$$data{'address_category1'} = ""; # prevent "NULL"
+    }
+    if(!$$data{'address_category2'}) {
+	$$data{'address_category2'} = ""; # prevent "NULL"
+    }
+    if(!$$data{'address_category3'}) {
+	$$data{'address_category3'} = ""; # prevent "NULL"
+    }
+    if(!$$data{'address_category4'}) {
+	$$data{'address_category4'} = ""; # prevent "NULL"
+    }
+
+    # reject if mandatory fields are not filled:
+    if(!$$data{'name'}) {
+	my %rawdata = (error=>"contactperson name not specified");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    # Check if there is already an identical contact person. If yes, don't insert a new one, just return the existing rowid:
+    my $rowid = _get_contactperson_rowid($$data{'name'}, $$data{'firstname'}, $$data{'email'});
+
+    if(!$rowid) { # insert new
+	$rowid = WiceSQL::Insert("address_contactperson", "returnID", undef, $data);
+    }
+
+    # insert a favourite too so that updates are synced automatically:
+    my %favourite = ("for_rowid"=>$rowid, "for_table"=>"address_contactperson");
+    WiceSQL::Insert("favourite", "", "", \%favourite);
+
+    if($$data{'for_rowid'}) {
+	%favourite = ("for_rowid"=>$$data{'for_rowid'}, "for_table"=>"address_company");
+	WiceSQL::Insert("favourite", "", "", \%favourite);
+    }
+
+    my %rawdata = (rowid=>$rowid, for_rowid=>$$data{'for_rowid'}, firstname=>$$data{'firstname'}, name=>$$data{'name'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+
+sub insert_company {
+
+    WicePermissions::perm_init();
+    if(!WicePermissions::perm_insert("address_company")) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    $$data{'user_group'} = WiceSQL::select_single_row("SELECT address_default_groups FROM usercats WHERE username=\"$main::username\" AND mandant=$main::mandant");
+
+    if(!$$data{'address_category1'}) {
+	$$data{'address_category1'} = ""; # prevent "NULL"
+    }
+    if(!$$data{'address_category2'}) {
+	$$data{'address_category2'} = ""; # prevent "NULL"
+    }
+    if(!$$data{'address_category3'}) {
+	$$data{'address_category3'} = ""; # prevent "NULL"
+    }
+    if(!$$data{'address_category4'}) {
+	$$data{'address_category4'} = ""; # prevent "NULL"
+    }
+
+    # Check if there is already an identical contact person, i.e. all fields identical except last_update, rowid and history_log. If yes, don't insert a new one, just return the existing rowid:
+    my $rowid = _get_company_rowid($$data{'company_name'}, $$data{'company_zip_code'});
+
+    if(!$rowid) { # insert new
+	$rowid = WiceSQL::Insert("address_company", "returnID", undef, $data);
+    }
+
+    # insert a favourite too so that updates are synced automatically:
+    my %favourite = ("for_rowid"=>$rowid, "for_table"=>"address_company");
+    WiceSQL::Insert("favourite", "", "", \%favourite);
+
+    my %rawdata = (rowid=>$rowid);
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+
+sub _get_company_rowid {
+    my ($company_name, $zip_code) = @_;
+
+    if(!$company_name) { return 0; }
+
+    # get neep filter:
+    my $users_user_groups = WiceSQL::select_single_row("SELECT user_group FROM users WHERE username=\"$main::username\" AND mandant=$main::mandant");
+    my $neep_filter = WicePermissions::render_sql_neep_filter($users_user_groups, "address_company");
+    if ($neep_filter) {
+	$neep_filter = "AND ($neep_filter)";
+    }
+    my $trash_filter = "";
+    if($main::global_config{'trash_address_company_category1'}) {
+	$trash_filter = " AND (address_company.address_category1!=".$main::dbh->quote($main::global_config{'trash_address_company_category1'})." OR address_company.address_category1 IS NULL)";
+    }
+
+    my $zip_code_sql = "";
+    if($zip_code) {
+	$zip_code_sql = "AND zip_code LIKE ".WiceSQL::quote($zip_code);
+    }
+
+    my $rowid = WiceSQL::select_single_row("SELECT rowid FROM address_company where mandant=$main::mandant $trash_filter $neep_filter $zip_code_sql AND name LIKE ".WiceSQL::quote($company_name));
+
+    if(!$rowid) { # insert new company
+	my %company_data = ("name" => $company_name);
+	$company_data{'user_group'} = WiceSQL::select_single_row("SELECT address_default_groups FROM usercats WHERE username=\"$main::username\" AND mandant=$main::mandant");
+	$rowid = WiceSQL::Insert("address_company", "returnID", undef, \%company_data);
+    }
+
+    return $rowid;
+}
+
+
+
+sub _get_contactperson_rowid {
+    my ($name, $firstname, $email) = @_;
+
+    if(!$name || !$firstname || !$email) { return 0; }
+
+    my $rowid = WiceSQL::select_single_row("SELECT rowid FROM address_contactperson WHERE email LIKE ".WiceSQL::quote($email)." AND name LIKE ".WiceSQL::quote($name)." AND firstname LIKE ".WiceSQL::quote($firstname)." AND mandant=$main::mandant AND (deactivated=0 OR deactivated IS NULL)");
+
+    return $rowid;
+}
+
+
+
+sub update_event {
+
+    WicePermissions::perm_init();
+    if(!WicePermissions::perm_editdel("calendar")) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    # check if $main::username may modify appointment with rowid=$$data{'rowid'}
+    if(!Calendar::perm_editdel_appointment($$data{'rowid'})) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    # decode employees: (e.g. "chahn@wice.de, hschmidt@wice.de" => "1\t5"):
+    if($$data{'employees'}) {
+	my $employees_emails = $$data{'employees'};
+	$$data{'employees'} = "";
+	foreach my $emp_email(split(/[,]/,$employees_emails)) {
+	    $emp_email =~ s/^\s//g;
+	    $emp_email =~ s/\s$//g;
+	    my $emp_rowid = WiceSQL::select_single_row("SELECT rowid FROM address_employee WHERE email LIKE ".WiceSQL::quote($emp_email)." AND mandant=$main::mandant AND (deactivated IS NULL OR deactivated=0)");
+	    if($emp_rowid) {
+		$$data{'employees'} .= "$emp_rowid\t";
+	    }
+	}
+	$$data{'employees'} =~ s/\t$//g;
+    }
+
+    WiceSQL::Update("appointment", $$data{'rowid'}, $data);
+
+    my %rawdata = (rowid=>$$data{'rowid'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+
+
+sub update_contact {
+
+    WicePermissions::perm_init();
+
+# The following should not be necessary since we will call AddressLib::perm_editdel_contactperson() some lines below:
+#    if(!WicePermissions::perm_editdel("address_contactperson")) {
+#	my %rawdata = (error=>"permission denied");
+#	print JSON->new->encode(\%rawdata);
+#	exit;
+#    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    # check if $main::username may modify current contactperson:
+    if(!AddressLib::perm_editdel_contactperson($$data{'rowid'})) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    if(!$$data{'for_rowid'}) {
+	$$data{'for_rowid'} = _get_company_rowid($$data{'company_name'}, $$data{'company_zip_code'});
+    }
+
+    WiceSQL::Update("address_contactperson", $$data{'rowid'}, $data);
+
+    my %rawdata = (rowid=>$$data{'rowid'}, for_rowid=>$$data{'for_rowid'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+
+sub update_company {
+
+    WicePermissions::perm_init();
+
+# The following should not be necessary since we will call AddressLib::perm_editdel_company() some lines below:
+#    if(!WicePermissions::perm_editdel("address_company")) {
+#	my %rawdata = (error=>"permission denied");
+#	print JSON->new->encode(\%rawdata);
+#	exit;
+#    }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    # check if $main::username may modify current company:
+
+    if(!AddressLib::perm_editdel_address("address_company", $$data{'rowid'})) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+    }
+
+    WiceSQL::Update("address_company", $$data{'rowid'}, $data);
+
+    my %rawdata = (rowid=>$$data{'rowid'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+
+sub get_contacts {
+
+    my $cgi = new CGI;
+    my %args = $cgi->Vars;
+
+    $args{'offset'} =~ s/\D//g;
+    $args{'entries_per_page'} =~ s/\D//g;
+
+    if(!$args{'offset'}) { $args{'offset'} = "0"; }
+    if(!$args{'entries_per_page'}) { $args{'entries_per_page'} = "100"; }
+
+    my $users_user_groups = WiceSQL::select_single_row("SELECT user_group FROM users WHERE username=\"$main::username\" AND mandant=$main::mandant");
+
+# print STDERR "\n USER GROUP: $users_user_groups \n";
+
+
+    # check address read perm:
+    my $access_denied = "";
+    if (!WicePermissions::perm_read("address_contactperson")) {
+	$access_denied = "AND 1=0"; # impossible, must result in 0 hits
+    }
+#print STDERR "WICE PERMISSIONS CONTACTS " . WicePermissions::perm_read("address_contactperson");
+
+    # get neep filter:
+    my $neep_filter = WicePermissions::render_sql_neep_filter($users_user_groups, "address_company");
+    if ($neep_filter) {
+	$neep_filter = "AND ($neep_filter)";
+    }
+
+    my $trash_filter = "";
+    if($main::global_config{'trash_address_company_category1'}) {
+	$trash_filter = " AND (address_company.address_category1!=".$main::dbh->quote($main::global_config{'trash_address_company_category1'})." OR address_company.address_category1 IS NULL)";
+    }
+
+    my $favourite_sql = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company') OR address_contactperson.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_contactperson'))";
+
+
+    my $query = "SELECT address_company.*, address_contactperson.*, address_company.name AS company_name, address_contactperson.rowid FROM address_contactperson LEFT JOIN address_company ON (address_company.rowid=address_contactperson.for_rowid AND address_company.mandant=$main::mandant) WHERE address_contactperson.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql ORDER BY address_contactperson.name, address_contactperson.firstname LIMIT $args{'offset'}, $args{'entries_per_page'}";
+
+
+    my $sth = WiceSQL::Prepare($query);
+
+#print STDERR "\n MANDANT: $main::mandant \n";
+#print STDERR "\n ACCESS DENIED: $access_denied \n";
+#print STDERR "\n NEEP FILTER: $neep_filter \n";
+#print STDERR "\n TRASH FILTER: $trash_filter \n";
+#print STDERR "\n FAVOURITE SQL: $favourite_sql \n";
+#print STDERR "\n QUERY: $query \n";
+#print STDERR Dumper($sth);
+#print STDERR "\n STH: $sth \n";
+
+    $sth->execute();
+    my @rawdata = ();
+    while(my $ref=$sth->fetchrow_hashref) {
+	push(@rawdata, $ref);
+    }
+
+    # support cp-less companies as well:
+    my $favourite_sql3 = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company'))";
+    #my $query3 = "SELECT address_company.* FROM address_company LEFT JOIN address_contactperson ON (address_company.rowid=address_contactperson.for_rowid AND address_contactperson.mandant=$main::mandant) WHERE address_contactperson.rowid IS NULL AND address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
+
+    # See mail from aschultz from 2016-08-26, 11:22: We select each company (not only cp-less companies) as extra contacts to prevent a conflict case:
+    my $query3 = "SELECT address_company.* FROM address_company WHERE address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
+
+
+    my $sth3 = WiceSQL::Prepare($query3);
+    $sth3->execute();
+    while(my $ref3=$sth3->fetchrow_hashref) {
+	push(@rawdata, $ref3);
+    }
+
+
+#    print encode_json(\@rawdata);
+    print JSON->new->encode(\@rawdata); # sic! encode_json does utf-8 conversion automatically - which we don't need because we are already on utf-8
+
+}
+
+
+
+
+sub get_events {
+
+    my $cgi = new CGI;
+    my %args = $cgi->Vars;
+
+    $args{'offset'} =~ s/\D//g;
+    $args{'entries_per_page'} =~ s/\D//g;
+
+    if(!$args{'offset'}) { $args{'offset'} = "0"; }
+    if(!$args{'entries_per_page'}) { $args{'entries_per_page'} = "100"; }
+
+    my $users_user_groups = WiceSQL::select_single_row("SELECT user_group FROM users WHERE username=\"$main::username\" AND mandant=$main::mandant");
+
+    # check address read perm:
+    my $access_denied = "";
+    if (!WicePermissions::perm_read("calendar")) {
+	$access_denied = "AND 1=0"; # impossible, must result in 0 hits
+    }
+
+print STDERR "WICE PERMISSIONS EVENTS " . WicePermissions::perm_read("calendar");
+
+    # get neep filter:
+    my $neep_filter = WicePermissions::render_sql_neep_filter($users_user_groups, "appointment");
+    if ($neep_filter) {
+	$neep_filter = "AND ($neep_filter)";
+    }
+
+    my $current_users_employee_id = "0";
+    if($args{'get_events_for_username'}) {
+	$args{'get_events_for_username'} =~ s/\W//g;
+	$current_users_employee_id = WiceMisc::get_employee_id_from_username($args{'get_events_for_username'});
+    } else {
+	$current_users_employee_id = WiceMisc::get_employee_id_from_username($main::username);
+    }
+
+    my $query = "SELECT appointment.*, CONCAT(address_contactperson.firstname, ' ', address_contactperson.name) AS contact_name, address_company.name AS company_name, category.name AS category_display, GROUP_CONCAT(CONCAT(address_employee.firstname, ' ', address_employee.name) SEPARATOR ', ') AS employees_display FROM appointment LEFT JOIN category ON (category.rowid=appointment.category1 AND category.mandant=$main::mandant) LEFT JOIN address_company ON (address_company.rowid=appointment.for_rowid AND address_company.mandant=$main::mandant) LEFT JOIN address_contactperson ON (address_contactperson.rowid=appointment.contactperson AND address_contactperson.mandant=$main::mandant), address_employee WHERE appointment.date>=CURRENT_DATE() AND FIND_IN_SET($current_users_employee_id, REPLACE(appointment.employees, '\t', ',')) AND FIND_IN_SET(address_employee.rowid, REPLACE(appointment.employees, '\t', ',')) AND appointment.mandant=$main::mandant $access_denied $neep_filter GROUP BY appointment.rowid ORDER BY appointment.date DESC, appointment.time_start DESC LIMIT $args{'offset'}, $args{'entries_per_page'}";
+
+    my $sth = WiceSQL::Prepare($query);
+
+    $sth->execute();
+    my @rawdata = ();
+    while(my $ref=$sth->fetchrow_hashref) {
+	push(@rawdata, $ref);
+    }
+
+    print JSON->new->encode(\@rawdata);
+
+}
+
+
+
+sub login {
+    my ($args) = @_;
+
+    WiceMisc::print_header("application/json");
+
+    if($$args{'username'} && $$args{'username'} && $$args{'mandant_name'}) {
+	my $query = "SELECT mandant.*, users.username FROM mandant, users WHERE mandant_name LIKE ".WiceSQL::quote($$args{'mandant_name'})." AND mandant.rowid=users.mandant AND users.username=".WiceSQL::quote($$args{'username'})." AND users.password=".WiceSQL::quote(Crypt::UnixCrypt::crypt($$args{'password'},$main::salt));
+	my $sth = WiceSQL::Prepare($query);
+	$sth->execute();
+	my $ref = $sth->fetchrow_hashref;
+
+	if($$ref{'rowid'}) {
+	    $main::mandant = $$ref{'rowid'};
+
+	    # login credentials are valid
+	    # before making a new cookie, check if there is a valid session alredy; if yes, return it:
+	    my $existing_cookie = WiceSQL::select_single_row("SELECT cookie FROM session WHERE mandant=$main::mandant AND username=".WiceSQL::quote($$ref{'username'}));
+	    if($existing_cookie) {
+		my %rawdata = (cookie=>$existing_cookie);
+		print JSON->new->encode(\%rawdata);
+		return;
+	    }
+
+	    $main::cookie = WiceAuth::make_cookie();
+
+	    # insert cookie in session table:
+	    my %h = (
+		cookie => $main::cookie,
+		ip_addr => $ENV{'REMOTE_ADDR'},
+		ssl_session_id => "$ENV{'REMOTE_USER'}",
+		mandant => $main::mandant,
+		date => WiceMisc::mysql_date(),
+		time => WiceMisc::mysql_time(),
+		username => $$ref{'username'},
+		last_access => time,
+		invisible => 1 # does not appear in login stats
+		);
+
+	    WiceSQL::Insert("session", 0, 1, \%h);
+
+	    my %rawdata = (cookie=>$main::cookie);
+	    print JSON->new->encode(\%rawdata);
+
+	} else {
+	    my %rawdata = (error=>"login data invalid");
+	    print JSON->new->encode(\%rawdata);
+
+	}
+
+    } else {
+	my %rawdata = (error=>"Missing credentials. Please provide mandant_name, username and password.");
+	print JSON->new->encode(\%rawdata);
+    }
+
+}
