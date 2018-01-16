@@ -13,6 +13,7 @@ use WiceMisc;
 use Calendar;
 use AddressLib;
 
+
 # Dev links
 
 # https://localhost:1443/pserv/base/json?method=login&username=shterion&mandant_name=sandbox&password=d36adb53
@@ -104,6 +105,9 @@ if($main::args{'method'} eq "get_account") {
     exit;
 } elsif($main::args{'method'} eq "update_company") {
     update_company();
+    exit;
+} elsif($main::args{'method'} eq "delete_company") {
+    delete_company();
     exit;
 } elsif($main::args{'method'} eq "get_events") {
     get_events();
@@ -969,9 +973,9 @@ sub get_all_persons {
 }
 
 
-# Delete a contact person
+# Delete a company
 
-sub delete_contactperson {
+sub delete_company {
 
     WicePermissions::perm_init();
 
@@ -996,7 +1000,7 @@ sub delete_contactperson {
     #WiceSQL::Do("DELETE FROM favourite WHERE username=\"$main::username\" AND mandant=$main::mandant AND for_table=\"address_contactperson\" AND for_rowid=".WiceSQL::quote($$data{'rowid'}));
 
     # we just set the mandant of negative instead of real delete from db
-    WiceSQL::Do("UPDATE address_contactperson SET mandant=-\"$main::mandant\" WHERE rowid=\"$$data{'rowid'}\"");
+    WiceSQL::Do("UPDATE address_company SET mandant=-\"$main::mandant\" WHERE rowid=\"$$data{'rowid'}\"");
 
 
     # also, remove the fav tag for any corresponding company:
