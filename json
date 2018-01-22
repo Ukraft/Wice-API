@@ -76,7 +76,7 @@ if($main::args{'method'} eq "get_account") {
 } elsif($main::args{'method'} eq "get_contacts") {
     get_contacts();
     exit;
-} elsif($main::args{'method'} eq "get_all_persons") { #works
+} elsif($main::args{'method'} eq "get_all_persons") {
     $main::args{'selected_tablename'} = 'address_contactperson';
     AddressLib::address_overview();
     # get_all_persons();
@@ -87,8 +87,8 @@ if($main::args{'method'} eq "get_account") {
 } elsif($main::args{'method'} eq "insert_contact") {
     insert_contact();
     exit;
-} elsif($main::args{'method'} eq "delete_contact") { # TODO
-    delete_contact();
+} elsif($main::args{'method'} eq "delete_person") { # delete_contact
+    delete_person();
     exit;
 } elsif($main::args{'method'} eq "update_contact") {
     update_contact();
@@ -895,6 +895,29 @@ sub delete_company {
 #    if($company_rowid) {
 #	WiceSQL::Do("DELETE FROM favourite WHERE username=\"$main::username\" AND mandant=$main::mandant AND for_table=\"address_company\" AND for_rowid=".WiceSQL::quote($company_rowid));
 #    }
+
+    my %rawdata = (rowid=>$$data{'rowid'});
+    print JSON->new->encode(\%rawdata);
+    exit;
+}
+
+
+sub delete_person {
+
+    WicePermissions::perm_init();
+
+# The following should not be necessary since we will call AddressLib::perm_editdel_contactperson() some lines below:
+   if(!WicePermissions::perm_editdel("address_contactperson")) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+   }
+
+    my $data = ();
+    $data = decode_json($main::args{'data'});
+
+    my %update = ('deactivated' => 1);
+    WiceSQL::Update('address_contactperson', $$data{'rowid'}, \%update);
 
     my %rawdata = (rowid=>$$data{'rowid'});
     print JSON->new->encode(\%rawdata);
