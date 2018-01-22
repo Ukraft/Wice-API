@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!/usr/bin/env perl -I ../base
 
 use strict;
 use Encode;
@@ -12,7 +12,7 @@ use WiceSQL;
 use WiceMisc;
 use Calendar;
 use AddressLib;
-
+use ArticleLib;
 
 # Dev links
 
@@ -76,8 +76,10 @@ if($main::args{'method'} eq "get_account") {
 } elsif($main::args{'method'} eq "get_contacts") {
     get_contacts();
     exit;
-} elsif($main::args{'method'} eq "get_all_persons") {
-    get_all_persons();
+} elsif($main::args{'method'} eq "get_all_persons") { #works
+    $main::args{'selected_tablename'} = 'address_contactperson';
+    AddressLib::address_overview();
+    # get_all_persons();
     exit;
 } elsif($main::args{'method'} eq "get_person") {
     get_person();
@@ -85,17 +87,15 @@ if($main::args{'method'} eq "get_account") {
 } elsif($main::args{'method'} eq "insert_contact") {
     insert_contact();
     exit;
-} elsif($main::args{'method'} eq "delete_contact") {
+} elsif($main::args{'method'} eq "delete_contact") { # TODO
     delete_contact();
-    exit;
-} elsif($main::args{'method'} eq "delete_contactperson") {
-    delete_contactperson();
     exit;
 } elsif($main::args{'method'} eq "update_contact") {
     update_contact();
     exit;
 } elsif($main::args{'method'} eq "get_all_companies"){
-    get_all_companies();
+    AddressLib::address_overview();
+    # get_all_companies();
     exit;
 } elsif($main::args{'method'} eq "get_company"){
     get_company();
@@ -122,13 +122,35 @@ if($main::args{'method'} eq "get_account") {
     update_event();
     exit;
 } elsif($main::args{'method'} eq "get_all_articles") {
-    get_all_articles();
+    ArticleLib::show_articles();
+    # get_all_articles();
     exit;
 } elsif($main::args{'method'} eq "get_article") {
     get_article();
     exit;
+}  elsif($main::args{'method'} eq "insert_article") {
+	my $json_args = decode_json($main::args{'data'});
+        foreach my $key(keys %{$json_args}) {
+            $main::args{$key} = $$json_args{$key};
+        }
+    $main::args{'submit'} = 1;
+    ArticleLib::new_article();
+    exit;
+} elsif($main::args{'method'} eq "update_article") {
+    my $json_args = decode_json($main::args{'data'});
+    foreach my $key(keys %{$json_args}) {
+        $main::args{$key} = $$json_args{$key};
+    }
+    $main::args{'submit'} = 1;
+    ArticleLib::edit_article();
+    exit;
 }
-
+elsif($main::args{'method'} eq "delete_article") {
+    my $json_args = decode_json($main::args{'data'});
+    $main::args{'rowid'} = $$json_args{'rowid'};
+    ArticleLib::del_article();
+    exit;
+}
 
 exit;
 
@@ -464,8 +486,6 @@ sub update_event {
 }
 
 
-
-
 sub update_contact {
 
     WicePermissions::perm_init();
@@ -703,73 +723,7 @@ sub login {
 
 }
 
-
-# API extenstion for elastiocio-wice component shterion 16/01/2018
-
-# Fetch all companies
-
-sub get_all_companies {
-
-    my $cgi = new CGI;
-    my %args = $cgi->Vars;
-
-    $args{'offset'} =~ s/\D//g;
-    $args{'entries_per_page'} =~ s/\D//g;
-
-    if(!$args{'offset'}) { $args{'offset'} = "0"; }
-    if(!$args{'entries_per_page'}) { $args{'entries_per_page'} = "100"; }
-
-    my $users_user_groups = WiceSQL::select_single_row("SELECT user_group FROM users WHERE username=\"$main::username\" AND mandant=$main::mandant");
-
-    # check address read perm:
-    my $access_denied = "";
-    if (!WicePermissions::perm_read("address_contactperson")) {
-	$access_denied = "AND 1=0"; # impossible, must result in 0 hits
-    }
-
-    # get neep filter:
-    my $neep_filter = WicePermissions::render_sql_neep_filter($users_user_groups, "address_company");
-    if ($neep_filter) {
-	$neep_filter = "AND ($neep_filter)";
-    }
-
-    my $trash_filter = "";
-    if($main::global_config{'trash_address_company_category1'}) {
-	$trash_filter = " AND (address_company.address_category1!=".$main::dbh->quote($main::global_config{'trash_address_company_category1'})." OR address_company.address_category1 IS NULL)";
-    }
-
-#    my $favourite_sql = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company') OR address_contactperson.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_contactperson'))";
-
-    # my $query = "SELECT address_company.*, address_contactperson.*, address_company.name AS company_name, address_contactperson.rowid FROM address_company LEFT JOIN address_company ON (address_company.rowid=address_contactperson.for_rowid AND address_company.mandant=$main::mandant) WHERE address_contactperson.mandant=$main::mandant $access_denied $neep_filter $trash_filter ORDER BY address_contactperson.name, address_contactperson.firstname LIMIT $args{'offset'}, $args{'entries_per_page'}";
-    my $query = "SELECT address_company.* FROM address_company WHERE address_company.mandant=$main::mandant $access_denied $trash_filter";
-
-    my $sth = WiceSQL::Prepare($query);
-
-        $sth->execute();
-        my @rawdata = ();
-        while(my $ref=$sth->fetchrow_hashref) {
-        push(@rawdata, $ref);
-        }
-
-    # # support cp-less companies as well:
-    # my $favourite_sql3 = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company'))";
-    # #my $query3 = "SELECT address_company.* FROM address_company LEFT JOIN address_contactperson ON (address_company.rowid=address_contactperson.for_rowid AND address_contactperson.mandant=$main::mandant) WHERE address_contactperson.rowid IS NULL AND address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
-
-    # # See mail from aschultz from 2016-08-26, 11:22: We select each company (not only cp-less companies) as extra contacts to prevent a conflict case:
-    # my $query3 = "SELECT address_company.* FROM address_company WHERE address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
-
-
-    # my $sth3 = WiceSQL::Prepare($query3);
-    # $sth3->execute();
-    # while(my $ref3=$sth3->fetchrow_hashref) {
-	# push(@rawdata, $ref3);
-    # }
-
-
-#    print encode_json(\@rawdata);
-    print JSON->new->encode(\@rawdata); # sic! encode_json does utf-8 conversion automatically - which we don't need because we are already on utf-8
-
-}
+# API extenstion for elastiocio-wice component
 
 # Get a single organisation by id
 
@@ -904,71 +858,6 @@ sub get_person {
 
 }
 
-# Fetch all persons
-
-sub get_all_persons {
-
-    my $cgi = new CGI;
-    my %args = $cgi->Vars;
-
-    $args{'offset'} =~ s/\D//g;
-    $args{'entries_per_page'} =~ s/\D//g;
-
-    if(!$args{'offset'}) { $args{'offset'} = "0"; }
-    if(!$args{'entries_per_page'}) { $args{'entries_per_page'} = "100"; }
-
-    my $users_user_groups = WiceSQL::select_single_row("SELECT user_group FROM users WHERE username=\"$main::username\" AND mandant=$main::mandant");
-
-    # check address read perm:
-    my $access_denied = "";
-    if (!WicePermissions::perm_read("address_contactperson")) {
-	$access_denied = "AND 1=0"; # impossible, must result in 0 hits
-    }
-
-    # get neep filter:
-    my $neep_filter = WicePermissions::render_sql_neep_filter($users_user_groups, "address_company");
-    if ($neep_filter) {
-	$neep_filter = "AND ($neep_filter)";
-    }
-
-    my $trash_filter = "";
-    if($main::global_config{'trash_address_company_category1'}) {
-	$trash_filter = " AND (address_company.address_category1!=".$main::dbh->quote($main::global_config{'trash_address_company_category1'})." OR address_company.address_category1 IS NULL)";
-    }
-
-#    my $favourite_sql = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company') OR address_contactperson.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_contactperson'))";
-
-    my $query = "SELECT address_company.*, address_contactperson.*, address_company.name AS company_name, address_contactperson.rowid FROM address_contactperson LEFT JOIN address_company ON (address_company.rowid=address_contactperson.for_rowid AND address_company.mandant=$main::mandant) WHERE address_contactperson.mandant=$main::mandant $access_denied $neep_filter $trash_filter ORDER BY address_contactperson.name, address_contactperson.firstname LIMIT $args{'offset'}, $args{'entries_per_page'}";
-
-    my $sth = WiceSQL::Prepare($query);
-
-    $sth->execute();
-    my @rawdata = ();
-    while(my $ref=$sth->fetchrow_hashref) {
-	push(@rawdata, $ref);
-    }
-
-    # # support cp-less companies as well:
-    # my $favourite_sql3 = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company'))";
-    # #my $query3 = "SELECT address_company.* FROM address_company LEFT JOIN address_contactperson ON (address_company.rowid=address_contactperson.for_rowid AND address_contactperson.mandant=$main::mandant) WHERE address_contactperson.rowid IS NULL AND address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
-
-    # # See mail from aschultz from 2016-08-26, 11:22: We select each company (not only cp-less companies) as extra contacts to prevent a conflict case:
-    # my $query3 = "SELECT address_company.* FROM address_company WHERE address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
-
-
-    # my $sth3 = WiceSQL::Prepare($query3);
-    # $sth3->execute();
-    # while(my $ref3=$sth3->fetchrow_hashref) {
-	# push(@rawdata, $ref3);
-    # }
-
-
-#    print encode_json(\@rawdata);
-    print JSON->new->encode(\@rawdata); # sic! encode_json does utf-8 conversion automatically - which we don't need because we are already on utf-8
-
-}
-
-
 # Delete a company
 
 sub delete_company {
@@ -976,11 +865,11 @@ sub delete_company {
     WicePermissions::perm_init();
 
 # The following should not be necessary since we will call AddressLib::perm_editdel_contactperson() some lines below:
-#    if(!WicePermissions::perm_editdel("address_contactperson")) {
-#	my %rawdata = (error=>"permission denied");
-#	print JSON->new->encode(\%rawdata);
-#	exit;
-#    }
+   if(!WicePermissions::perm_editdel("address_company")) {
+	my %rawdata = (error=>"permission denied");
+	print JSON->new->encode(\%rawdata);
+	exit;
+   }
 
     my $data = ();
     $data = decode_json($main::args{'data'});
@@ -996,8 +885,10 @@ sub delete_company {
     #WiceSQL::Do("DELETE FROM favourite WHERE username=\"$main::username\" AND mandant=$main::mandant AND for_table=\"address_contactperson\" AND for_rowid=".WiceSQL::quote($$data{'rowid'}));
 
     # we just set the mandant of negative instead of real delete from db
-    WiceSQL::Do("UPDATE address_company SET mandant=-\"$main::mandant\" WHERE rowid=\"$$data{'rowid'}\"");
+    # WiceSQL::Do("UPDATE address_company SET mandant=-\"$main::mandant\" WHERE rowid=\"$$data{'rowid'}\"");
 
+    my %update = ('address_category1' => $main::global_config{'trash_address_company_category1'});
+    WiceSQL::Update('address_company', $$data{'rowid'}, \%update);
 
     # also, remove the fav tag for any corresponding company:
 #    my $company_rowid = WiceSQL::select_single_row("SELECT for_rowid FROM address_contactperson WHERE mandant=$main::mandant AND rowid=".WiceSQL::quote($$data{'rowid'}));
@@ -1008,69 +899,6 @@ sub delete_company {
     my %rawdata = (rowid=>$$data{'rowid'});
     print JSON->new->encode(\%rawdata);
     exit;
-}
-
-# Fetch all articles
-
-sub get_all_articles {
-
-    my $cgi = new CGI;
-    my %args = $cgi->Vars;
-
-    $args{'offset'} =~ s/\D//g;
-    $args{'entries_per_page'} =~ s/\D//g;
-
-    if(!$args{'offset'}) { $args{'offset'} = "0"; }
-    if(!$args{'entries_per_page'}) { $args{'entries_per_page'} = "100"; }
-
-    my $users_user_groups = WiceSQL::select_single_row("SELECT user_group FROM users WHERE username=\"$main::username\" AND mandant=$main::mandant");
-
-    # check address read perm:
-    my $access_denied = "";
-    if (!WicePermissions::perm_read("address_contactperson")) {
-	$access_denied = "AND 1=0"; # impossible, must result in 0 hits
-    }
-
-    # get neep filter:
-    my $neep_filter = WicePermissions::render_sql_neep_filter($users_user_groups, "address_company");
-    if ($neep_filter) {
-	$neep_filter = "AND ($neep_filter)";
-    }
-
-    my $trash_filter = "";
-    if($main::global_config{'trash_address_company_category1'}) {
-	$trash_filter = " AND (address_company.address_category1!=".$main::dbh->quote($main::global_config{'trash_address_company_category1'})." OR address_company.address_category1 IS NULL)";
-    }
-
-    # my $favourite_sql = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company') OR address_contactperson.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_contactperson'))";
-
-    my $query = "SELECT article.* FROM article WHERE article.mandant=$main::mandant $access_denied ";
-
-    my $sth = WiceSQL::Prepare($query);
-    $sth->execute();
-    my @rawdata = ();
-    while(my $ref=$sth->fetchrow_hashref) {
-	push(@rawdata, $ref);
-    }
-
-    # # support cp-less companies as well:
-    # my $favourite_sql3 = "AND (address_company.rowid IN (SELECT for_rowid FROM favourite WHERE mandant=$main::mandant AND username=".WiceSQL::quote($main::username)." AND for_table='address_company'))";
-    # #my $query3 = "SELECT address_company.* FROM address_company LEFT JOIN address_contactperson ON (address_company.rowid=address_contactperson.for_rowid AND address_contactperson.mandant=$main::mandant) WHERE address_contactperson.rowid IS NULL AND address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
-
-    # # See mail from aschultz from 2016-08-26, 11:22: We select each company (not only cp-less companies) as extra contacts to prevent a conflict case:
-    # my $query3 = "SELECT address_company.* FROM address_company WHERE address_company.mandant=$main::mandant $access_denied $neep_filter $trash_filter $favourite_sql3 ORDER BY address_company.name LIMIT $args{'offset'}, $args{'entries_per_page'}";
-
-
-    # my $sth3 = WiceSQL::Prepare($query3);
-    # $sth3->execute();
-    # while(my $ref3=$sth3->fetchrow_hashref) {
-	# push(@rawdata, $ref3);
-    # }
-
-
-#    print encode_json(\@rawdata);
-    print JSON->new->encode(\@rawdata); # sic! encode_json does utf-8 conversion automatically - which we don't need because we are already on utf-8
-
 }
 
 # Get a single article by id
