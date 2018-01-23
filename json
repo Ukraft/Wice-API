@@ -87,7 +87,7 @@ if($main::args{'method'} eq "get_account") {
 } elsif($main::args{'method'} eq "insert_contact") {
     insert_contact();
     exit;
-} elsif($main::args{'method'} eq "delete_person") { # delete_contact
+} elsif($main::args{'method'} eq "delete_person") {
     delete_person();
     exit;
 } elsif($main::args{'method'} eq "update_contact") {
@@ -95,7 +95,6 @@ if($main::args{'method'} eq "get_account") {
     exit;
 } elsif($main::args{'method'} eq "get_all_companies"){
     AddressLib::address_overview();
-    # get_all_companies();
     exit;
 } elsif($main::args{'method'} eq "get_company"){
     get_company();
@@ -123,7 +122,6 @@ if($main::args{'method'} eq "get_account") {
     exit;
 } elsif($main::args{'method'} eq "get_all_articles") {
     ArticleLib::show_articles();
-    # get_all_articles();
     exit;
 } elsif($main::args{'method'} eq "get_article") {
     get_article();
